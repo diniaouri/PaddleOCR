@@ -1,10 +1,7 @@
 import re
-import shutil
-import tempfile
 from pathlib import Path
 
-import fitz  # pymupdf
-from paddleocr import PaddleOCR, PaddleOCRVL
+from paddleocr import PaddleOCRVL
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 INPUT_DIRS = {
@@ -13,12 +10,10 @@ INPUT_DIRS = {
 }
 OUTPUT_BASE = "/home/dimitra/Documents/Github/PaddleOCR/my_project/output_vl"
 
-SAVE_MARKDOWN        = True
-SAVE_PLAINTEXT       = True
-SAVE_SEARCHABLE_PDF  = True
-SAVE_JSON            = False
+SAVE_MARKDOWN  = True
+SAVE_PLAINTEXT = True
+SAVE_JSON      = False
 
-# VLM pipeline — high quality markdown/text output
 PIPELINE_OPTIONS = dict(
     pipeline_version             = "v1.5",
     use_doc_orientation_classify = True,
@@ -35,9 +30,6 @@ PREDICT_OPTIONS = dict(
     max_new_tokens     = 4096,
     repetition_penalty = 1.05,
 )
-
-# DPI to render PDF pages for classic OCR
-PDF_RENDER_DPI = 150
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -71,168 +63,9 @@ def markdown_to_plaintext(md_text: str) -> str:
     return text.strip()
 
 
-def _get_classic_ocr_blocks(classic_ocr, image_path: str) -> list[dict]:
-    """
-    Run classic PP-OCRv4 on an image file.
-    Uses rec_polys (polygon point arrays) to compute tight axis-aligned bboxes.
-    Coordinate space is taken from the preprocessed output image dimensions.
-    Returns list of {"bbox": [x1,y1,x2,y2], "text": str, "img_w": int, "img_h": int}
-    """
-    import numpy as np
-    from PIL import Image
-
-    img    = Image.open(image_path).convert("RGB")
-    img_w, img_h = img.size   # PIL: (width, height)
-    img_np = np.array(img)
-
-    result = list(classic_ocr.predict(img_np))
-
-    blocks = []
-    for page in result:
-        if page is None:
-            continue
-
-        texts = page.get("rec_texts", [])
-        # rec_polys: list of numpy arrays, each shape (N,2) with (x,y) points
-        polys = page.get("rec_polys", None)
-
-        if polys is None or len(polys) == 0:
-            continue
-
-        # Use the preprocessed image dimensions as the coordinate space.
-        # The preprocessor may have rotated/warped the image, so its output
-        # shape is the correct reference frame for the polygon coords.
-        pre     = page.get("doc_preprocessor_res", {})
-        out_img = pre.get("output_img", None)
-        if out_img is not None:
-            coord_h, coord_w = out_img.shape[:2]  # numpy shape: (H, W, C)
-        else:
-            coord_w, coord_h = img_w, img_h
-
-        for text, poly in zip(texts, polys):
-            text = text.strip()
-            if not text:
-                continue
-
-            pts = np.array(poly)           # shape (N, 2)
-            x1  = float(pts[:, 0].min())
-            y1  = float(pts[:, 1].min())
-            x2  = float(pts[:, 0].max())
-            y2  = float(pts[:, 1].max())
-
-            blocks.append({
-                "bbox":  [x1, y1, x2, y2],
-                "text":  text,
-                "img_w": coord_w,
-                "img_h": coord_h,
-            })
-
-    return blocks
-
-
-def _overlay_blocks_on_page(out_page, blocks, page_w, page_h):
-    """
-    Place invisible selectable text onto a PDF page.
-    blocks: list of {"bbox": [x1,y1,x2,y2], "text": str, "img_w": int, "img_h": int}
-    Each block is one OCR line — placed at precise baseline position.
-    """
-    for block in blocks:
-        bbox  = block["bbox"]
-        text  = block["text"]
-        img_w = block["img_w"]
-        img_h = block["img_h"]
-
-        # Scale OCR image pixel coords → PDF point coords
-        x1 = bbox[0] * page_w / img_w
-        y1 = bbox[1] * page_h / img_h
-        x2 = bbox[2] * page_w / img_w
-        y2 = bbox[3] * page_h / img_h
-
-        box_h = y2 - y1
-        box_w = x2 - x1
-        if box_w <= 0 or box_h <= 0:
-            continue
-
-        fontsize = max(4.0, min(12.0, box_h * 0.85))
-
-        out_page.insert_text(
-            fitz.Point(x1, y2 - box_h * 0.1),  # baseline near bottom of bbox
-            text,
-            fontsize=fontsize,
-            fontname="helv",
-            color=(0, 0, 0),
-            render_mode=3,   # invisible but searchable/copyable
-            overlay=True,
-        )
-
-
-def make_searchable_overlay_pdf(
-    original_pdf_path: Path,
-    output_pdf_path: Path,
-    classic_ocr,
-    tmp_dir: Path,
-):
-    """
-    Render each PDF page to an image, run classic PP-OCRv4 for precise
-    line bboxes, then write a PDF with the original page + invisible text overlay.
-    """
-    src_doc = fitz.open(str(original_pdf_path))
-    out_doc = fitz.open()
-    mat     = fitz.Matrix(PDF_RENDER_DPI / 72, PDF_RENDER_DPI / 72)
-
-    for page_idx, page in enumerate(src_doc):
-        out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
-        out_page = out_doc[page_idx]
-
-        page_w = page.rect.width
-        page_h = page.rect.height
-
-        pix      = page.get_pixmap(matrix=mat, alpha=False)
-        img_path = str(tmp_dir / f"page_{page_idx}.png")
-        pix.save(img_path)
-
-        blocks = _get_classic_ocr_blocks(classic_ocr, img_path)
-        print(f"    page {page_idx+1}: {len(blocks)} text lines overlaid")
-        _overlay_blocks_on_page(out_page, blocks, page_w, page_h)
-
-    out_doc.save(str(output_pdf_path), garbage=4, deflate=True)
-    src_doc.close()
-    out_doc.close()
-
-
-def make_searchable_pdf_from_image(
-    image_path: Path,
-    output_pdf_path: Path,
-    classic_ocr,
-):
-    """For PNG/JPG: embed original image as background + overlay invisible text."""
-    out_doc  = fitz.open()
-    img_doc  = fitz.open(str(image_path))
-    img_rect = img_doc[0].rect
-    img_doc.close()
-
-    out_page = out_doc.new_page(width=img_rect.width, height=img_rect.height)
-    out_page.insert_image(img_rect, filename=str(image_path))
-
-    blocks = _get_classic_ocr_blocks(classic_ocr, str(image_path))
-    print(f"    {len(blocks)} text lines overlaid")
-    _overlay_blocks_on_page(out_page, blocks, img_rect.width, img_rect.height)
-
-    out_doc.save(str(output_pdf_path), garbage=4, deflate=True)
-    out_doc.close()
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-# Pass 1: VLM — high quality structured markdown + plain text
-vlm_pipeline = PaddleOCRVL(**PIPELINE_OPTIONS)
-
-# Pass 2: Classic OCR — precise line-level bboxes for searchable PDF overlay
-classic_ocr = None
-if SAVE_SEARCHABLE_PDF:
-    classic_ocr = PaddleOCR(ocr_version="PP-OCRv4", lang="en")
-
-tmp_dir = Path(tempfile.mkdtemp())
+pipeline = PaddleOCRVL(**PIPELINE_OPTIONS)
 
 for category, input_dir in INPUT_DIRS.items():
     input_path = Path(input_dir)
@@ -255,10 +88,9 @@ for category, input_dir in INPUT_DIRS.items():
         out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # ── Pass 1: VLM → markdown + plain text ──────────────────────
-            results_raw = vlm_pipeline.predict(str(file), **PREDICT_OPTIONS)
+            results_raw = pipeline.predict(str(file), **PREDICT_OPTIONS)
 
-            results = vlm_pipeline.restructure_pages(
+            results = pipeline.restructure_pages(
                 results_raw,
                 merge_tables=True,
                 relevel_titles=True,
@@ -290,19 +122,9 @@ for category, input_dir in INPUT_DIRS.items():
                 txt_path.write_text(plain, encoding="utf-8")
                 print(f"  ✓ Plaintext  → {txt_path}")
 
-            # ── Pass 2: Classic OCR → precise bboxes → searchable PDF ────
-            if SAVE_SEARCHABLE_PDF:
-                overlay_path = out_dir / f"{file.stem}_searchable.pdf"
-                if file.suffix.lower() == ".pdf":
-                    make_searchable_overlay_pdf(file, overlay_path, classic_ocr, tmp_dir)
-                else:
-                    make_searchable_pdf_from_image(file, overlay_path, classic_ocr)
-                print(f"  ✓ Search PDF → {overlay_path}")
-
         except Exception as e:
             print(f"  ✗ ERROR: {e}")
             import traceback; traceback.print_exc()
 
-vlm_pipeline.close()
-shutil.rmtree(tmp_dir, ignore_errors=True)
+pipeline.close()
 print(f"\n\nDone! Output saved to: {OUTPUT_BASE}")
