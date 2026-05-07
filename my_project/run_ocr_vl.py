@@ -80,7 +80,7 @@ def _get_classic_ocr_blocks(classic_ocr, image_path: str) -> list[dict]:
     import numpy as np
     from PIL import Image
 
-    img   = Image.open(image_path).convert("RGB")
+    img    = Image.open(image_path).convert("RGB")
     img_w, img_h = img.size
     img_np = np.array(img)
 
@@ -218,9 +218,10 @@ def make_searchable_pdf_from_image(
 vlm_pipeline = PaddleOCRVL(**PIPELINE_OPTIONS)
 
 # Pass 2: Classic OCR — precise line-level bboxes for searchable PDF overlay
+# Note: show_log is not a valid arg in this version of PaddleOCR
 classic_ocr = None
 if SAVE_SEARCHABLE_PDF:
-    classic_ocr = PaddleOCR(ocr_version="PP-OCRv4", lang="en", show_log=False)
+    classic_ocr = PaddleOCR(ocr_version="PP-OCRv4", lang="en")
 
 tmp_dir = Path(tempfile.mkdtemp())
 
