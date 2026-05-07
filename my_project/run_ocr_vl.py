@@ -65,55 +65,85 @@ def markdown_to_plaintext(md_text: str) -> str:
     return text.strip()
 
 
+def _parse_entry(entry_str: str) -> dict | None:
+    """
+    Parse one parsing_res_list entry of the form:
+        #################
+        label:  <label>
+        bbox:   [x1, y1, x2, y2]
+        content: <text, possibly multiline>
+        #################
+    Returns {"bbox": [...], "text": "..."} or None if unparseable.
+    """
+    bbox = None
+    text_lines = []
+    in_content = False
+
+    for line in entry_str.splitlines():
+        # strip only trailing whitespace so leading tabs are preserved for detection
+        stripped = line.rstrip()
+
+        if stripped.startswith("bbox:"):
+            # value is everything after "bbox:" and optional whitespace/tab
+            val = stripped[5:].strip()
+            # val looks like "[1, 648, 50, 1593]"
+            val = val.strip("[]")
+            try:
+                bbox = [float(x.strip()) for x in val.split(",")]
+            except ValueError:
+                pass
+            in_content = False
+
+        elif stripped.startswith("content:"):
+            # first line of content
+            val = stripped[8:].strip()  # remove "content:" + whitespace/tab
+            text_lines = [val] if val else []
+            in_content = True
+
+        elif in_content:
+            # stop at closing separator
+            if stripped.startswith("#####"):
+                in_content = False
+            else:
+                text_lines.append(stripped)
+
+    if bbox is None or not text_lines:
+        return None
+
+    text = "\n".join(text_lines).strip()
+    if not text:
+        return None
+
+    return {"bbox": bbox, "text": text}
+
+
 def _extract_text_blocks(res) -> list[dict]:
     """
-    Parse parsing_res_list entries which look like:
-        #################
-        label:   header
-        bbox:    [530, 128, 726, 150]
-        content: THE CRISIS.
-        #################
-    Returns list of {bbox: [x1,y1,x2,y2], text: str}
+    Extract all text blocks with bounding boxes from a result object.
+    parsing_res_list entries may be str or a custom paddlex string subclass —
+    we always coerce to plain str first.
     """
     blocks = []
     parsing_res_list = res.get("parsing_res_list", [])
 
     for entry in parsing_res_list:
-        if not isinstance(entry, str):
-            continue
-
-        bbox_match    = re.search(r"bbox:\s*\[([^\]]+)\]", entry)
-        content_match = re.search(r"content:\t(.+?)(?=\n#{5,}|\Z)", entry, re.DOTALL)
-
-        if not bbox_match or not content_match:
-            continue
-
-        try:
-            bbox = [float(x.strip()) for x in bbox_match.group(1).split(",")]
-        except ValueError:
-            continue
-
-        text = content_match.group(1).strip()
-        if not text:
-            continue
-
-        blocks.append({"bbox": bbox, "text": text})
+        parsed = _parse_entry(str(entry))
+        if parsed:
+            blocks.append(parsed)
 
     return blocks
 
 
 def _overlay_text_on_page(out_page, blocks, page_w, page_h, img_w, img_h):
     """
-    Place invisible selectable text onto a PDF page.
-    Uses insert_text (not insert_textbox) so text is never silently dropped.
-    For multi-line blocks, splits lines and places each one individually
-    spaced evenly within the bounding box.
+    Place invisible selectable text onto a PDF page using insert_text.
+    Multi-line blocks are split and each line placed at its own baseline.
     """
     for block in blocks:
         bbox = block["bbox"]
         text = block["text"]
 
-        # Scale OCR image coords → PDF point coords
+        # Scale OCR image pixel coords → PDF point coords
         x1 = bbox[0] * page_w / img_w
         y1 = bbox[1] * page_h / img_h
         x2 = bbox[2] * page_w / img_w
@@ -133,7 +163,6 @@ def _overlay_text_on_page(out_page, blocks, page_w, page_h, img_w, img_h):
         line_h   = box_h / n_lines
 
         for j, line in enumerate(lines):
-            # Baseline = top of box + (j+1) * line_height - small descender offset
             baseline_y = y1 + (j + 1) * line_h - line_h * 0.15
             out_page.insert_text(
                 fitz.Point(x1, baseline_y),
@@ -141,7 +170,7 @@ def _overlay_text_on_page(out_page, blocks, page_w, page_h, img_w, img_h):
                 fontsize=fontsize,
                 fontname="helv",
                 color=(0, 0, 0),
-                render_mode=3,   # 3 = invisible (searchable/copyable only)
+                render_mode=3,   # invisible but searchable/copyable
                 overlay=True,
             )
 
@@ -268,7 +297,7 @@ for category, input_dir in INPUT_DIRS.items():
             if SAVE_SEARCHABLE_PDF:
                 overlay_path = out_dir / f"{file.stem}_searchable.pdf"
                 if file.suffix.lower() == ".pdf":
-                    # Pass results_raw (not restructured) — has parsing_res_list intact
+                    # Use results_raw (not restructured) — has parsing_res_list intact
                     make_searchable_overlay_pdf(file, results_raw, overlay_path)
                 else:
                     make_searchable_pdf_from_image(file, results_raw[0], overlay_path)
