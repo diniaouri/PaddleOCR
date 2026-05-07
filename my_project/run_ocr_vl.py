@@ -36,7 +36,7 @@ PREDICT_OPTIONS = dict(
     repetition_penalty = 1.05,
 )
 
-# DPI to render PDF pages for classic OCR (higher = more accurate bbox coords)
+# DPI to render PDF pages for classic OCR
 PDF_RENDER_DPI = 150
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -74,45 +74,57 @@ def markdown_to_plaintext(md_text: str) -> str:
 def _get_classic_ocr_blocks(classic_ocr, image_path: str) -> list[dict]:
     """
     Run classic PP-OCRv4 on an image file.
+    Uses rec_polys (polygon point arrays) to compute tight axis-aligned bboxes.
+    Coordinate space is taken from the preprocessed output image dimensions.
     Returns list of {"bbox": [x1,y1,x2,y2], "text": str, "img_w": int, "img_h": int}
-    One entry per detected text line with precise bboxes.
     """
     import numpy as np
     from PIL import Image
 
     img    = Image.open(image_path).convert("RGB")
-    img_w, img_h = img.size
+    img_w, img_h = img.size   # PIL: (width, height)
     img_np = np.array(img)
 
-    result = classic_ocr.predict(img_np)
+    result = list(classic_ocr.predict(img_np))
 
     blocks = []
     for page in result:
         if page is None:
             continue
+
         texts = page.get("rec_texts", [])
-        boxes = page.get("rec_boxes", None)    # [[x1,y1,x2,y2], ...]
-        polys = page.get("det_polys", None)    # [[[x,y],...], ...]
+        # rec_polys: list of numpy arrays, each shape (N,2) with (x,y) points
+        polys = page.get("rec_polys", None)
 
-        if boxes is None and polys is not None:
-            boxes = []
-            for poly in polys:
-                xs = [p[0] for p in poly]
-                ys = [p[1] for p in poly]
-                boxes.append([min(xs), min(ys), max(xs), max(ys)])
-
-        if boxes is None:
+        if polys is None or len(polys) == 0:
             continue
 
-        for text, box in zip(texts, boxes):
+        # Use the preprocessed image dimensions as the coordinate space.
+        # The preprocessor may have rotated/warped the image, so its output
+        # shape is the correct reference frame for the polygon coords.
+        pre     = page.get("doc_preprocessor_res", {})
+        out_img = pre.get("output_img", None)
+        if out_img is not None:
+            coord_h, coord_w = out_img.shape[:2]  # numpy shape: (H, W, C)
+        else:
+            coord_w, coord_h = img_w, img_h
+
+        for text, poly in zip(texts, polys):
             text = text.strip()
             if not text:
                 continue
+
+            pts = np.array(poly)           # shape (N, 2)
+            x1  = float(pts[:, 0].min())
+            y1  = float(pts[:, 1].min())
+            x2  = float(pts[:, 0].max())
+            y2  = float(pts[:, 1].max())
+
             blocks.append({
-                "bbox":  [float(v) for v in box],
+                "bbox":  [x1, y1, x2, y2],
                 "text":  text,
-                "img_w": img_w,
-                "img_h": img_h,
+                "img_w": coord_w,
+                "img_h": coord_h,
             })
 
     return blocks
@@ -169,14 +181,12 @@ def make_searchable_overlay_pdf(
     mat     = fitz.Matrix(PDF_RENDER_DPI / 72, PDF_RENDER_DPI / 72)
 
     for page_idx, page in enumerate(src_doc):
-        # Copy original page pixel-perfect
         out_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
         out_page = out_doc[page_idx]
 
         page_w = page.rect.width
         page_h = page.rect.height
 
-        # Render page to PNG for classic OCR
         pix      = page.get_pixmap(matrix=mat, alpha=False)
         img_path = str(tmp_dir / f"page_{page_idx}.png")
         pix.save(img_path)
@@ -218,7 +228,6 @@ def make_searchable_pdf_from_image(
 vlm_pipeline = PaddleOCRVL(**PIPELINE_OPTIONS)
 
 # Pass 2: Classic OCR — precise line-level bboxes for searchable PDF overlay
-# Note: show_log is not a valid arg in this version of PaddleOCR
 classic_ocr = None
 if SAVE_SEARCHABLE_PDF:
     classic_ocr = PaddleOCR(ocr_version="PP-OCRv4", lang="en")
